@@ -1,0 +1,347 @@
+package com.ambulance.preemption.mqtt;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+
+import javax.net.ssl.SSLSocketFactory;
+
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
+import org.eclipse.paho.client.mqttv3.MqttCallbackExtended;
+import org.eclipse.paho.client.mqttv3.MqttClient;
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
+import org.eclipse.paho.client.mqttv3.MqttException;
+import org.eclipse.paho.client.mqttv3.MqttMessage;
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.stereotype.Component;
+
+import com.ambulance.preemption.service.PreemptionService;
+import com.ambulance.preemption.util.Db;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+
+@Component
+@ConditionalOnProperty(
+    name = "app.mqtt.enabled",
+    havingValue = "true"
+)
+public class HiveMqttSubscriber {
+
+    @Value("${app.mqtt.broker}")
+    private String broker;
+
+    @Value("${app.mqtt.username}")
+    private String username;
+
+    @Value("${app.mqtt.password}")
+    private String password;
+
+    @Value("${app.mqtt.client-id:vaps-springboot-local}")
+    private String clientId;
+
+    @Value("${app.mqtt.topic-scans:ambulance/reader/+/scan}")
+    private String scanTopic;
+
+    private final Db db;
+    private final PreemptionService preempt;
+    private final ObjectMapper objectMapper;
+
+    private MqttClient client;
+
+    public HiveMqttSubscriber(
+            Db db,
+            PreemptionService preempt,
+            ObjectMapper objectMapper) {
+
+        this.db = db;
+        this.preempt = preempt;
+        this.objectMapper = objectMapper;
+    }
+
+    @PostConstruct
+    public void connect() throws MqttException {
+
+        client = new MqttClient(
+            broker,
+            clientId,
+            new MemoryPersistence()
+        );
+
+        MqttConnectOptions options =
+            new MqttConnectOptions();
+
+        options.setUserName(username);
+        options.setPassword(password.toCharArray());
+
+        options.setSocketFactory(
+            (SSLSocketFactory) SSLSocketFactory.getDefault()
+        );
+
+        options.setAutomaticReconnect(true);
+        options.setCleanSession(true);
+        options.setConnectionTimeout(15);
+        options.setKeepAliveInterval(30);
+
+        client.setCallback(new MqttCallbackExtended() {
+
+            @Override
+            public void connectComplete(
+                    boolean reconnect,
+                    String serverURI) {
+
+                System.out.println(
+                    "Connected to HiveMQ Cloud: " + serverURI
+                );
+
+                try {
+                    client.subscribe(scanTopic, 1);
+
+                    System.out.println(
+                        "Subscribed to: " + scanTopic
+                    );
+
+                } catch (MqttException e) {
+                    System.err.println(
+                        "MQTT subscription error: "
+                        + e.getMessage()
+                    );
+                }
+            }
+
+            @Override
+            public void connectionLost(Throwable cause) {
+
+                System.err.println(
+                    "MQTT connection lost: "
+                    + (cause == null
+                        ? "Unknown reason"
+                        : cause.getMessage())
+                );
+            }
+
+            @Override
+            public void messageArrived(
+                    String topic,
+                    MqttMessage message) {
+
+                handleScan(topic, message);
+            }
+
+            @Override
+            public void deliveryComplete(
+                    IMqttDeliveryToken token) {
+                // No action required.
+            }
+        });
+
+        client.connect(options);
+
+        System.out.println(
+            "HiveMQ Cloud MQTT connection established"
+        );
+    }
+
+    /**
+     * Handle a scan received from an ESP32 RFID reader.
+     *
+     * This is a prototype integration.
+     * MQTT publisher identity must be authenticated
+     * separately before production use.
+     */
+    private void handleScan(
+            String topic,
+            MqttMessage message) {
+
+        String readerCode = null;
+
+        try {
+            String payload = new String(
+                message.getPayload(),
+                StandardCharsets.UTF_8
+            );
+
+            System.out.println("-----------------------");
+            System.out.println("RFID MQTT Message Received");
+            System.out.println("Topic: " + topic);
+            System.out.println("Payload: " + payload);
+
+            // Parse the ESP32 JSON payload.
+            JsonNode scan = objectMapper.readTree(payload);
+
+            if (scan == null || !scan.isObject()) {
+                System.err.println("Invalid scan JSON");
+                return;
+            }
+
+            JsonNode readerNode = scan.get("reader");
+            JsonNode uidNode = scan.get("uid");
+
+            if (readerNode == null
+                    || !readerNode.isTextual()
+                    || uidNode == null
+                    || !uidNode.isTextual()) {
+
+                System.err.println(
+                    "Missing or invalid reader/uid"
+                );
+                return;
+            }
+
+            readerCode = readerNode.asText().trim();
+
+            String tagUid = uidNode.asText()
+                .trim()
+                .toUpperCase();
+
+            // Basic input validation.
+            if (!readerCode.matches("[A-Za-z0-9_-]{1,32}")) {
+                System.err.println("Invalid reader code");
+                return;
+            }
+
+            if (!tagUid.matches("[0-9A-F]{8,20}")) {
+                System.err.println("Invalid RFID UID");
+                publishResult(readerCode, "DENIED");
+                return;
+            }
+
+            // Verify the MQTT topic matches the payload.
+            String expectedTopic =
+                "ambulance/reader/"
+                + readerCode
+                + "/scan";
+
+            if (!expectedTopic.equals(topic)) {
+                System.err.println(
+                    "Reader/topic mismatch"
+                );
+                return;
+            }
+
+            // Find a registered and enabled reader.
+            Map<String, Object> reader = db.one(
+                "SELECT * FROM rfid_readers "
+                + "WHERE reader_code=? AND is_enabled=1",
+                readerCode
+            );
+
+            if (reader == null) {
+                System.err.println(
+                    "Unknown or disabled reader: "
+                    + readerCode
+                );
+
+                publishResult(readerCode, "DENIED");
+                return;
+            }
+
+            // Use the existing VAPS verification logic.
+            Map<String, Object> result =
+                preempt.processScan(reader, tagUid);
+
+            String decision =
+                String.valueOf(result.get("result"));
+
+            System.out.println(
+                "Verification result: " + decision
+            );
+
+            // Reply to the RFID ESP32.
+            if ("PREEMPT".equals(decision)) {
+                publishResult(readerCode, "ACTIVE");
+            } else {
+                publishResult(readerCode, "DENIED");
+            }
+
+            System.out.println("-----------------------");
+
+        } catch (Exception e) {
+
+            System.err.println(
+                "MQTT scan processing failed: "
+                + e.getMessage()
+            );
+
+            // Fail closed on processing errors.
+            if (readerCode != null
+                    && readerCode.matches(
+                        "[A-Za-z0-9_-]{1,32}")) {
+
+                publishResult(readerCode, "DENIED");
+            }
+        }
+    }
+
+    /**
+     * Publish the verification result back to
+     * the ESP32 RFID reader.
+     *
+     * These messages are not retained.
+     */
+    private void publishResult(
+            String readerCode,
+            String result) {
+
+        String resultTopic =
+            "ambulance/reader/"
+            + readerCode
+            + "/result";
+
+        try {
+            if (client == null || !client.isConnected()) {
+                System.err.println(
+                    "MQTT disconnected; result not sent"
+                );
+                return;
+            }
+
+            MqttMessage response = new MqttMessage(
+                result.getBytes(StandardCharsets.UTF_8)
+            );
+
+            response.setQos(1);
+            response.setRetained(false);
+
+            client.publish(resultTopic, response);
+
+            System.out.println(
+                "Published to: " + resultTopic
+            );
+
+            System.out.println(
+                "Reader response: " + result
+            );
+
+        } catch (MqttException e) {
+            System.err.println(
+                "Failed to publish reader result: "
+                + e.getMessage()
+            );
+        }
+    }
+
+    @PreDestroy
+    public void disconnect() {
+
+        if (client != null) {
+            try {
+                if (client.isConnected()) {
+                    client.disconnect();
+                }
+
+                client.close();
+
+            } catch (MqttException e) {
+                System.err.println(
+                    "MQTT shutdown error: "
+                    + e.getMessage()
+                );
+            }
+        }
+    }
+}

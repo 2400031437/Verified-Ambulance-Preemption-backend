@@ -1,0 +1,308 @@
+
+package com.ambulance.preemption.service;
+
+import com.ambulance.preemption.util.Db;
+import com.ambulance.preemption.util.U;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+/**
+ * Core logic for RFID scan verification,
+ * ambulance trip management, and preemption decisions.
+ *
+ * Used by REST reader endpoints and the MQTT subscriber.
+ */
+@Service
+public class PreemptionService {
+
+    private final Db db;
+    private final Events events;
+    private final int maxTripMinutes;
+
+    public PreemptionService(
+            Db db,
+            Events events,
+            @Value("${app.max-trip-minutes}") int maxTripMinutes) {
+
+        this.db = db;
+        this.events = events;
+        this.maxTripMinutes = maxTripMinutes;
+    }
+
+    /**
+     * Process an RFID scan.
+     *
+     * An ambulance is eligible for preemption only when:
+     * 1. Its RFID tag is registered.
+     * 2. The ambulance is enabled.
+     * 3. Its tag status is ACTIVE.
+     * 4. It has an ACTIVE trip.
+     *
+     * IMPORTANT:
+     * The caller must authenticate the physical RFID reader
+     * before invoking this method.
+     *
+     * A PREEMPT result is an application-level decision,
+     * not authorization to operate a real traffic signal.
+     */
+    public Map<String, Object> processScan(
+            Map<String, Object> reader,
+            String tagUid) {
+
+        if (reader == null || reader.get("id") == null) {
+            throw new IllegalArgumentException(
+                "A validated RFID reader is required"
+            );
+        }
+
+        if (tagUid == null || tagUid.trim().isEmpty()) {
+            throw new IllegalArgumentException(
+                "RFID tag UID is required"
+            );
+        }
+
+        String normalizedTag = tagUid.trim().toUpperCase();
+
+        // Find the ambulance registered with this RFID tag.
+        Map<String, Object> amb = db.one(
+            "SELECT * FROM ambulances WHERE rfid_tag_uid=?",
+            normalizedTag
+        );
+
+        String result;
+        Map<String, Object> trip = null;
+
+        // STEP 1: Check whether the RFID tag is registered.
+        if (amb == null) {
+            result = "UNKNOWN_TAG";
+        }
+
+        // STEP 2: Check whether the ambulance is enabled.
+        else if (U.i(amb.get("is_enabled")) == 0) {
+            result = "DISABLED";
+        }
+
+        // STEP 3: Check whether the tag is ACTIVE.
+        else if (!"ACTIVE".equals(amb.get("tag_status"))) {
+            result = "IGNORED_NORMAL";
+        }
+
+        // STEP 4: Check for an ACTIVE ambulance trip.
+        else {
+            trip = db.one(
+                "SELECT * FROM trips "
+                + "WHERE ambulance_id=? "
+                + "AND status='ACTIVE' "
+                + "ORDER BY id DESC LIMIT 1",
+                amb.get("id")
+            );
+
+            if (trip == null) {
+                // IMPORTANT FIX:
+                // An ACTIVE tag without an ACTIVE trip
+                // must not trigger preemption.
+                result = "NO_ACTIVE_TRIP";
+            } else {
+                result = "PREEMPT";
+
+                // Record the preemption window for this reader.
+                db.update(
+                    "UPDATE rfid_readers "
+                    + "SET preempt_until="
+                    + "DATE_ADD(NOW(), INTERVAL ? SECOND) "
+                    + "WHERE id=?",
+                    reader.get("green_seconds"),
+                    reader.get("id")
+                );
+            }
+        }
+
+        // STEP 5: Store every scan in MySQL.
+        db.update(
+            "INSERT INTO scan_events "
+            + "(reader_id, tag_uid, ambulance_id, trip_id, result) "
+            + "VALUES (?, ?, ?, ?, ?)",
+            reader.get("id"),
+            normalizedTag,
+            amb == null ? null : amb.get("id"),
+            trip == null ? null : trip.get("id"),
+            result
+        );
+
+        // STEP 6: Prepare the event for the existing frontend.
+        Map<String, Object> evt = U.map(
+            "reader_code", reader.get("reader_code"),
+            "location", reader.get("location_name"),
+            "signal_id", reader.get("signal_id"),
+            "ambulance_number",
+                amb == null ? null : amb.get("ambulance_number"),
+            "tag_uid", normalizedTag,
+            "result", result,
+            "at", Instant.now().toString()
+        );
+
+        // Notify admin through the existing event mechanism.
+        events.emit("scan", evt, "admin");
+
+        // Notify the hospital and driver for authorized trips.
+        if ("PREEMPT".equals(result) && trip != null) {
+            events.emit(
+                "preempt",
+                evt,
+                "hospital:" + trip.get("hospital_id"),
+                "driver:" + trip.get("driver_user_id")
+            );
+        }
+
+        // STEP 7: Return the verification decision.
+        boolean green = "PREEMPT".equals(result);
+
+        return U.map(
+            "result", result,
+            "action", green ? "GREEN" : "NONE",
+            "green_seconds",
+                green ? reader.get("green_seconds") : 0,
+            "signal_id", reader.get("signal_id"),
+            "approach_direction",
+                reader.get("approach_direction")
+        );
+    }
+
+    /**
+     * Start an ambulance trip.
+     *
+     * Called when the user saves a new trip.
+     * Creates the trip and activates the ambulance RFID tag.
+     */
+    @Transactional
+    public void startTrip(
+            Object ambulanceId,
+            Object driverUserId,
+            Object hospitalId,
+            String patientName,
+            String age,
+            String gender,
+            String problem,
+            String severity,
+            String notes) {
+
+        db.update(
+            "INSERT INTO trips "
+            + "(ambulance_id, driver_user_id, hospital_id, "
+            + "patient_name, patient_age, patient_gender, "
+            + "problem, severity, notes) "
+            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ambulanceId,
+            driverUserId,
+            hospitalId,
+            patientName == null ? "Unknown" : patientName,
+            age,
+            gender,
+            problem,
+            severity,
+            notes
+        );
+
+        db.update(
+            "UPDATE ambulances "
+            + "SET tag_status='ACTIVE', on_duty=1 "
+            + "WHERE id=?",
+            ambulanceId
+        );
+    }
+
+    /**
+     * End an ambulance trip.
+     *
+     * Deactivates the tag when the trip is
+     * completed, cancelled, or expired.
+     */
+    public void endTrip(
+            Map<String, Object> trip,
+            String status) {
+
+        db.update(
+            "UPDATE trips "
+            + "SET status=?, ended_at=NOW() "
+            + "WHERE id=? AND status='ACTIVE'",
+            status,
+            trip.get("id")
+        );
+
+        db.update(
+            "UPDATE ambulances "
+            + "SET tag_status='NORMAL' "
+            + "WHERE id=?",
+            trip.get("ambulance_id")
+        );
+
+        events.emit(
+            "trip:ended",
+            U.map(
+                "trip_id", trip.get("id"),
+                "status", status,
+                "ambulance_id", trip.get("ambulance_id")
+            ),
+            "driver:" + trip.get("driver_user_id"),
+            "hospital:" + trip.get("hospital_id"),
+            "admin"
+        );
+    }
+
+    /**
+     * Automatically expire trips that exceed
+     * the configured maximum duration.
+     *
+     * Runs every 60 seconds.
+     */
+    @Scheduled(fixedDelay = 60000)
+    public void expireOldTrips() {
+
+        List<Map<String, Object>> old = db.list(
+            "SELECT * FROM trips "
+            + "WHERE status='ACTIVE' "
+            + "AND started_at < "
+            + "DATE_SUB(NOW(), INTERVAL ? MINUTE)",
+            maxTripMinutes
+        );
+
+        for (Map<String, Object> trip : old) {
+            endTrip(trip, "EXPIRED");
+        }
+    }
+
+    /**
+     * Calculate distance between two GPS coordinates
+     * using the Haversine formula.
+     */
+    public static double distM(
+            double lat1,
+            double lng1,
+            double lat2,
+            double lng2) {
+
+        double r = 6371000;
+
+        double p1 = Math.toRadians(lat1);
+        double p2 = Math.toRadians(lat2);
+
+        double dp = Math.toRadians(lat2 - lat1);
+        double dl = Math.toRadians(lng2 - lng1);
+
+        double h =
+            Math.sin(dp / 2) * Math.sin(dp / 2)
+            + Math.cos(p1)
+            * Math.cos(p2)
+            * Math.sin(dl / 2)
+            * Math.sin(dl / 2);
+
+        return 2 * r * Math.asin(Math.sqrt(h));
+    }
+}

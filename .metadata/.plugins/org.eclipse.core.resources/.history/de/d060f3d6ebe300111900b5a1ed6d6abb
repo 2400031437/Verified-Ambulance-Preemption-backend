@@ -1,0 +1,159 @@
+
+package com.ambulance.preemption.mqtt;
+
+import java.nio.charset.StandardCharsets;
+
+import javax.net.ssl.SSLSocketFactory;
+
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
+import org.eclipse.paho.client.mqttv3.MqttCallbackExtended;
+import org.eclipse.paho.client.mqttv3.MqttClient;
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
+import org.eclipse.paho.client.mqttv3.MqttException;
+import org.eclipse.paho.client.mqttv3.MqttMessage;
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.stereotype.Component;
+
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+
+@Component
+@ConditionalOnProperty(
+    name = "app.mqtt.enabled",
+    havingValue = "true"
+)
+public class HiveMqttSubscriber {
+
+    @Value("${app.mqtt.broker}")
+    private String broker;
+
+    @Value("${app.mqtt.username}")
+    private String username;
+
+    @Value("${app.mqtt.password}")
+    private String password;
+
+    @Value("${app.mqtt.client-id:vaps-springboot-local}")
+    private String clientId;
+
+    @Value("${app.mqtt.topic-scans:vaps/readers/+/scans}")
+    private String scanTopic;
+
+    private MqttClient client;
+
+    @PostConstruct
+    public void connect() throws MqttException {
+
+        client = new MqttClient(
+            broker,
+            clientId,
+            new MemoryPersistence()
+        );
+
+        MqttConnectOptions options = new MqttConnectOptions();
+
+        options.setUserName(username);
+        options.setPassword(password.toCharArray());
+
+        // Secure TLS connection for HiveMQ Cloud
+        options.setSocketFactory(
+            (SSLSocketFactory) SSLSocketFactory.getDefault()
+        );
+
+        options.setAutomaticReconnect(true);
+        options.setCleanSession(true);
+        options.setConnectionTimeout(15);
+        options.setKeepAliveInterval(30);
+
+        client.setCallback(new MqttCallbackExtended() {
+
+            @Override
+            public void connectComplete(
+                boolean reconnect,
+                String serverURI
+            ) {
+                System.out.println(
+                    "Connected to HiveMQ Cloud: " + serverURI
+                );
+
+                try {
+                    client.subscribe(scanTopic, 1);
+
+                    System.out.println(
+                        "Subscribed to: " + scanTopic
+                    );
+
+                } catch (MqttException e) {
+                    System.err.println(
+                        "MQTT subscription error: "
+                        + e.getMessage()
+                    );
+                }
+            }
+
+            @Override
+            public void connectionLost(Throwable cause) {
+                System.err.println(
+                    "MQTT connection lost: "
+                    + (cause == null
+                        ? "Unknown reason"
+                        : cause.getMessage())
+                );
+            }
+
+            @Override
+            public void messageArrived(
+                String topic,
+                MqttMessage message
+            ) {
+
+                String payload = new String(
+                    message.getPayload(),
+                    StandardCharsets.UTF_8
+                );
+
+                System.out.println("-----------------------");
+                System.out.println("RFID MQTT Message Received");
+                System.out.println("Topic: " + topic);
+                System.out.println("Payload: " + payload);
+                System.out.println("-----------------------");
+
+                // Later:
+                // Validate RFID scan and call PreemptionService
+                // to save valid events in MySQL.
+            }
+
+            @Override
+            public void deliveryComplete(
+                IMqttDeliveryToken token
+            ) {
+                // Not used for this subscriber
+            }
+        });
+
+        client.connect(options);
+
+        System.out.println(
+            "HiveMQ Cloud MQTT connection established"
+        );
+    }
+
+    @PreDestroy
+    public void disconnect() {
+        if (client != null) {
+            try {
+                if (client.isConnected()) {
+                    client.disconnect();
+                }
+                client.close();
+            } catch (MqttException e) {
+                System.err.println(
+                    "MQTT shutdown error: " + e.getMessage()
+                );
+            }
+        }
+    }
+}
